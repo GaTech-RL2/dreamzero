@@ -148,6 +148,14 @@ class WANPolicyHeadConfig(PretrainedConfig):
     image_encoder_cfg: dict = field(default=None)
     vae_cfg: dict = field(default=None)
 
+    # RICL-style retrieved-frame grounding (see CausalWanModel). Frames-only video grounding:
+    # K=num_retrieved_demos demos x X=frames_per_demo clean latent frames are VAE-encoded and
+    # prepended to the clean teacher-forcing half so generated frames attend to them.
+    # enable_retrieved_context=false -> stock DreamZero (bit-identical).
+    enable_retrieved_context: bool = field(default=False, metadata={"help": "Enable RICL retrieved-frame grounding."})
+    num_retrieved_demos: int = field(default=0, metadata={"help": "K: retrieved demos per query."})
+    frames_per_demo: int = field(default=0, metadata={"help": "X: frames retrieved per demo."})
+
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         for key, value in kwargs.items():
@@ -197,7 +205,11 @@ class WANPolicyHead(ActionHead):
         self.clip_feas = None
         self.ys = None
         self.current_start_frame = 0
+        self._num_retrieved_kv = 0  # RICL: # retrieved demo frames prepended to the KV cache
         self.language = None
+        # Default so the bare (Hydra-instantiated) model is usable without post_initialize();
+        # post_initialize() re-sets this when a TRT engine is requested via LOAD_TRT_ENGINE.
+        self.trt_engine = None
 
         self.ip_rank = 0
         self.ip_size = 1
@@ -560,6 +572,60 @@ class WANPolicyHead(ActionHead):
             latents = self.vae.encode(input_video, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
         return latents
 
+    def _encode_retrieved_latents(self, data, target_h, target_w):
+        """VAE-encode RICL retrieved demo frames into R = K*X CLEAN latent frames.
+
+        ``data['retrieved_video']``: ``[B, K, X, Hgrid, Wgrid, C]`` uint8, grid-composed
+        like the observation; ``data['retrieved_mask']``: ``[B, K]`` bool. Each retrieved
+        frame is encoded INDEPENDENTLY (T=1) so the causal video VAE yields exactly one
+        latent frame per frame (identical to a position-0 frame), giving exactly R clean
+        latent frames to prepend. Invalid demos (mask False) are zeroed. Frames are
+        normalized + resized to ``(target_h, target_w)`` exactly like the observation, so
+        they live in the same latent space the DiT denoises.
+
+        Returns ``(retrieved_latents [B, 48, R, H_lat, W_lat], R)`` or ``(None, 0)``.
+        """
+        if not getattr(self.config, "enable_retrieved_context", False):
+            return None, 0
+        if not isinstance(data, dict) and not hasattr(data, "__contains__"):
+            return None, 0
+        if "retrieved_video" not in data:
+            return None, 0
+        rv = data["retrieved_video"]      # [B, K, X, Hg, Wg, C]
+        rmask = data["retrieved_mask"]    # [B, K]
+        Bv, K, X = int(rv.shape[0]), int(rv.shape[1]), int(rv.shape[2])
+        R = K * X
+        if R == 0:
+            return None, 0
+        rv = rv.reshape(Bv, R, *rv.shape[3:])         # [B, R, Hg, Wg, C]
+        rv = rearrange(rv, "b r h w c -> b c r h w")  # [B, C, R, Hg, Wg]
+        if rv.dtype == torch.uint8:
+            rv = rv.float() / 255.0
+            b2, c2, r2, h2, w2 = rv.shape
+            rv = rv.permute(0, 2, 1, 3, 4).reshape(b2 * r2, c2, h2, w2)
+            rv = self.normalize_video(rv).reshape(b2, r2, c2, h2, w2).permute(0, 2, 1, 3, 4)
+        rv = rv.to(dtype=self.dtype)
+        b2, c2, r2, h2, w2 = rv.shape
+        if target_h is not None and target_w is not None and (h2, w2) != (target_h, target_w):
+            rv = torch.nn.functional.interpolate(
+                rv.reshape(b2 * r2, c2, h2, w2), size=(target_h, target_w),
+                mode="bilinear", align_corners=False,
+            ).reshape(b2, c2, r2, target_h, target_w)
+            h2, w2 = target_h, target_w
+        # Encode each retrieved frame as its own T=1 clip -> R independent clean latent frames.
+        rv_single = rv.permute(0, 2, 1, 3, 4).reshape(b2 * r2, c2, 1, h2, w2)
+        rl = self.encode_video(
+            rv_single, self.tiled,
+            (self.tile_size_height, self.tile_size_width),
+            (self.tile_stride_height, self.tile_stride_width),
+        )  # [B*R, z, 1, hl, wl]
+        zc, hl, wl = rl.shape[1], rl.shape[-2], rl.shape[-1]
+        rl = rl.reshape(Bv, R, zc, hl, wl).permute(0, 2, 1, 3, 4)  # [B, z, R, hl, wl]
+        # Zero invalid demos (each demo's X frames share its validity flag).
+        m = rmask.to(rl.dtype).reshape(Bv, K, 1).expand(Bv, K, X).reshape(Bv, R)
+        rl = rl * m[:, None, :, None, None]
+        return rl, R
+
     def encode_image(self, image, num_frames, height, width):
         with torch.amp.autocast(dtype=torch.bfloat16, device_type=torch.device(self._device).type):
             batch_size = image.shape[0]
@@ -664,10 +730,16 @@ class WANPolicyHead(ActionHead):
 
         clip_feas, ys, _ = self.encode_image(image, num_frames, height, width)
 
+        # RICL retrieved-frame grounding: R = K*X clean demo latent frames, encoded at the
+        # SAME spatial dims as the observation (identical latent H,W). (None, 0) when disabled.
+        retrieved_latents, num_retrieved_frames = self._encode_retrieved_latents(data, height, width)
+
         latents = latents.to(self._device)
         clip_feas = clip_feas.to(self._device)
         ys = ys.to(self._device)
         prompt_embs = prompt_embs.to(self._device)
+        if retrieved_latents is not None:
+            retrieved_latents = retrieved_latents.to(self._device)
        
         # Loss
         noise = torch.randn_like(latents)
@@ -757,21 +829,29 @@ class WANPolicyHead(ActionHead):
             noisy_actions = None
             training_target_action = None
 
+        # Clean teacher-forcing half: prepend the R retrieved demo frames (always-visible
+        # grounding context). The NOISY half is unchanged, so action/state block alignment holds.
+        clean_x_in = latents.transpose(1, 2)
+        if retrieved_latents is not None and num_retrieved_frames > 0:
+            clean_x_in = torch.cat([retrieved_latents.to(clean_x_in.dtype), clean_x_in], dim=2)
+
         # Compute loss
         with torch.amp.autocast(dtype=torch.bfloat16, device_type=torch.device(self._device).type):
             if actions.numel() > 0:
                 video_noise_pred, action_noise_pred = self.model(
                     noisy_latents.transpose(1, 2), timestep=timestep, clip_feature=clip_feas, y=ys, context=prompt_embs, seq_len=seq_len,
                     state=state_features, embodiment_id=embodiment_id,
-                    action=noisy_actions, timestep_action=timestep_action, 
-                    clean_x=latents.transpose(1, 2),
+                    action=noisy_actions, timestep_action=timestep_action,
+                    clean_x=clean_x_in,
+                    num_retrieved_frames=num_retrieved_frames,
                 )
             else:
                 video_noise_pred, action_noise_pred = self.model(
-                    noisy_latents.transpose(1, 2), timestep=timestep, timestep_action=timestep_action, 
+                    noisy_latents.transpose(1, 2), timestep=timestep, timestep_action=timestep_action,
                     clip_feature=clip_feas, y=ys, context=prompt_embs, seq_len=seq_len,
                     state=state_features, embodiment_id=embodiment_id,
-                    clean_x=latents.transpose(1, 2),
+                    clean_x=clean_x_in,
+                    num_retrieved_frames=num_retrieved_frames,
                 )
 
             # Per-sample dynamics loss
@@ -1056,6 +1136,10 @@ class WANPolicyHead(ActionHead):
         start_image_encoder_event.record()
 
         _, _, num_frames, height, width = videos.shape
+        # PIXEL dims: height/width get REUSED for the LATENT dims below (noise_obs.shape).
+        # The retrieved-frame VAE encode needs the same PIXEL resolution as the obs (training
+        # passes videos.shape dims), so capture them here before they're overwritten.
+        pixel_h, pixel_w = height, width
         if videos.shape[2] == 4 or videos.shape[2] == 9:
             # special case for real-world eval where language is updated
             image = videos[:, :, -1:].transpose(1, 2)
@@ -1141,6 +1225,28 @@ class WANPolicyHead(ActionHead):
         start_kv_event.record()
 
         if self.current_start_frame == 0:
+            # RICL: prepend R = K*X retrieved demo frames as CLEAN KV context at positions 0..R-1
+            # (video-only, timestep 0), so the observation + generated frames attend back to them.
+            # Mirrors the training clean prefix. Then the obs frame goes at position R.
+            self._num_retrieved_kv = 0
+            if getattr(self.config, "enable_retrieved_context", False) and ("retrieved_video" in data):
+                rl, R = self._encode_retrieved_latents(data, pixel_h, pixel_w)
+                if rl is not None and R > 0:
+                    rl = rl.to(device=image.device, dtype=image.dtype)  # [B, 48, R, H, W]
+                    zt = torch.zeros([batch_size, 1], device=noise_obs.device, dtype=torch.int64)
+                    for i in range(R):
+                        self._run_diffusion_steps(
+                            noisy_input=rl[:, :, i:i + 1],
+                            timestep=zt,
+                            action=None, timestep_action=None, state=None, embodiment_id=None,
+                            context=prompt_embs, seq_len=frame_seqlen,
+                            y=self.ys[:, :, 0:1], clip_feature=self.clip_feas,
+                            kv_caches=kv_caches, crossattn_caches=crossattn_caches,
+                            kv_cache_metadata=dict(start_frame=i, update_kv_cache=True),
+                        )
+                    self._num_retrieved_kv = R
+                    self.current_start_frame = R  # obs frame is appended after the prefix
+
             timestep = torch.ones([batch_size, 1], device=noise_obs.device, dtype=torch.int64) * 0
             self._run_diffusion_steps(
                 noisy_input=image.transpose(1, 2),
@@ -1156,7 +1262,7 @@ class WANPolicyHead(ActionHead):
                 kv_caches=kv_caches,
                 crossattn_caches=crossattn_caches,
                 kv_cache_metadata=dict(
-                    start_frame=0,
+                    start_frame=self.current_start_frame,
                     update_kv_cache=True,
                 ),
             )
@@ -1164,7 +1270,9 @@ class WANPolicyHead(ActionHead):
             
         timestep = torch.ones([batch_size, self.num_frame_per_block], device=noise_obs.device, dtype=torch.int64) * 0
 
-        if self.current_start_frame != 1:
+        # "Just warmed up" is cs == 1 + R (R retrieved prefix frames + 1 obs frame); skip the
+        # ref-frame pass then (no previous generated block yet).
+        if self.current_start_frame != 1 + self._num_retrieved_kv:
             current_ref_latents = image[:, -self.num_frame_per_block:]
             if self.current_start_frame <= self.ys.shape[2]:
                 y = self.ys[:, :, self.current_start_frame - self.num_frame_per_block : self.current_start_frame]
@@ -1308,7 +1416,7 @@ class WANPolicyHead(ActionHead):
         latents_action = noisy_input_action
         output = latents
 
-        if self.current_start_frame == 1:
+        if self.current_start_frame == 1 + self._num_retrieved_kv:
             output = torch.cat([image, output], dim=1)
         self.current_start_frame += self.num_frame_per_block
 

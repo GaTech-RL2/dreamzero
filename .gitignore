@@ -244,3 +244,7 @@ groot/control/envs/yam/data/eval/*
 
 checkpoints/
 video_pred_output*/
+
+# RICL scratch / vendored deps (not for commit)
+_dzdeps/
+_ricl_*_smoke.py

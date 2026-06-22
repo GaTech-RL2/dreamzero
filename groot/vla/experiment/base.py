@@ -366,8 +366,13 @@ class BaseTrainer(transformers.Trainer):
         self.loss_queues = {}
         self.loss_queue_size = 10
 
-    def _get_train_sampler(self):
-        return BaseSampler(self.train_dataset, shuffle=True, seed=self.args.seed)
+    def _get_train_sampler(self, dataset=None):
+        # transformers>=4.46 passes the dataset positionally (sampler_fn(dataset)); older
+        # versions call with no arg. Accept both.
+        return BaseSampler(
+            dataset if dataset is not None else self.train_dataset,
+            shuffle=True, seed=self.args.seed,
+        )
 
     def _get_eval_sampler(self, eval_dataset):
         return BaseSampler(eval_dataset, shuffle=False)

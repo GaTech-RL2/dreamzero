@@ -599,6 +599,19 @@ class DreamTransform(InvertibleModalityTransform):
                 for key in action_and_mask_keys
             ), f"Shape mismatch: {[(key, transformed_data[key].shape) for key in action_and_mask_keys]}"
 
+        # RICL retrieved-frame grounding: compose each retrieved demo's X frames into the SAME
+        # multiview grid as the observation (reusing _prepare_video), so the action head
+        # VAE-encodes them in the same latent space. data['retrieved_video']: [K, X, V, H, W, C].
+        if "retrieved_video" in data:
+            rv = data["retrieved_video"]
+            grids = []
+            for k in range(rv.shape[0]):
+                g = self._prepare_video({"video": rv[k]})          # [1, X, C, Hg, Wg]
+                g = rearrange(g, "one x c h w -> (x one) h w c")   # [X, Hg, Wg, C]
+                grids.append(g.astype(np.uint8))
+            transformed_data["retrieved_video"] = np.stack(grids)  # [K, X, Hg, Wg, C]
+            transformed_data["retrieved_mask"] = np.asarray(data["retrieved_mask"]).astype(bool)
+
         return transformed_data
 
     def apply_batch(self, data: dict, batch_size: int) -> dict:

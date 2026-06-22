@@ -1,0 +1,19 @@
+# @package _global_
+# Wan2.2-TI2V-5B + RICL retrieved-frame grounding.
+# Inherits the 5B config and adds the retrieval knobs. The three top-level vars below are
+# read by BOTH the model (action head) and the RoboTwin data config (data=dreamzero/robotwin_wan22),
+# so a single override flips baseline<->treatment:
+#   baseline  : (defaults) enable_retrieved_context=false num_retrieved_demos=0
+#   treatment : enable_retrieved_context=true num_retrieved_demos=2 frames_per_demo=4
+defaults:
+  - wan_flow_matching_action_tf_wan22
+
+enable_retrieved_context: false
+num_retrieved_demos: 0
+frames_per_demo: 4
+
+action_head_cfg:
+  config:
+    enable_retrieved_context: ${enable_retrieved_context}
+    num_retrieved_demos: ${num_retrieved_demos}
+    frames_per_demo: ${frames_per_demo}

@@ -661,12 +661,17 @@ class CausalWanSelfAttention(nn.Module):
     def _process_noisy_image_blocks(self, noisy_image_q, noisy_image_k, noisy_image_v,
                                      clean_image_k, clean_image_v,
                                      noisy_action_k, noisy_action_v, noisy_state_k, noisy_state_v,
-                                     half_frames, action_horizon, state_horizon):
+                                     half_frames, action_horizon, state_horizon,
+                                     clean_prefix_tokens=0):
         """Process noisy image blocks with teacher forcing pattern - OPTIMIZED
-        
+
         First frame: conditioning, cannot attend to anything (self-attention only)
-        Block i: attends to action[i] + state[i] + first_clean_frame + clean_blocks[0:i] + current_noisy_block
-        
+        Block i: attends to action[i] + state[i] + retrieved_prefix + first_clean_frame + clean_blocks[0:i] + current_noisy_block
+
+        ``clean_prefix_tokens`` = R*frame_seqlen retrieved demo frames prepended to the
+        clean half (always-visible grounding context). The clean-context end for each
+        noisy block is offset by it so every generated block sees all retrieved frames.
+
         OPTIMIZATION: Pre-allocate output, pre-compute indices, reduce memory allocations
         """
         block_size = self.frame_seqlen * self.num_frame_per_block
@@ -688,7 +693,9 @@ class CausalWanSelfAttention(nn.Module):
         # Pre-compute all block indices to reduce loop overhead
         noisy_block_starts = [self.frame_seqlen + i * block_size for i in range(num_blocks)]
         noisy_block_ends = [min(start + block_size, noisy_image_q.shape[1]) for start in noisy_block_starts]
-        clean_context_ends = [self.frame_seqlen + i * block_size for i in range(num_blocks)]
+        # +clean_prefix_tokens: clean half starts with R retrieved frames; offset so each noisy
+        # block attends to [all retrieved frames | first clean frame | clean blocks 0..i].
+        clean_context_ends = [clean_prefix_tokens + self.frame_seqlen + i * block_size for i in range(num_blocks)]
         action_block_starts = [i * self.num_action_per_block for i in range(num_blocks)]
         action_block_ends = [start + self.num_action_per_block for start in action_block_starts]
         state_block_starts = [i * self.num_state_per_block for i in range(num_blocks)]
@@ -721,19 +728,23 @@ class CausalWanSelfAttention(nn.Module):
             ], dim=1)
             
             output[:, noisy_start:noisy_end] = self.attn(q_block, k_context, v_context)
-        
+
         return output
     
     def _process_noisy_action_blocks(self, noisy_action_q, noisy_action_k, noisy_action_v,
                                       clean_image_k, clean_image_v,
                                       noisy_image_k, noisy_image_v,
                                       noisy_state_k, noisy_state_v,
-                                      half_frames, action_horizon, state_horizon):
+                                      half_frames, action_horizon, state_horizon,
+                                      clean_prefix_tokens=0):
         """Process noisy action blocks with teacher forcing pattern - OPTIMIZED
-        
+
         First action (for first frame): cannot attend to anything (self-attention only)
-        Action block i: attends to first_clean_frame + clean_blocks[0:i] + noisy_image[i] + action[i] + state[i]
-        
+        Action block i: attends to retrieved_prefix + first_clean_frame + clean_blocks[0:i] + noisy_image[i] + action[i] + state[i]
+
+        ``clean_prefix_tokens`` offsets the clean-context end so each noisy action block
+        also attends to all retrieved demo frames (grounding). See _process_noisy_image_blocks.
+
         OPTIMIZATION: Pre-allocate output, pre-compute indices, reduce memory allocations
         """
         num_blocks = (half_frames - 1) // self.num_frame_per_block
@@ -747,7 +758,7 @@ class CausalWanSelfAttention(nn.Module):
         # Pre-compute all block indices
         action_block_starts = [i * self.num_action_per_block for i in range(num_blocks)]
         action_block_ends = [start + self.num_action_per_block for start in action_block_starts]
-        clean_context_ends = [self.frame_seqlen + i * self.frame_seqlen * self.num_frame_per_block for i in range(num_blocks)]
+        clean_context_ends = [clean_prefix_tokens + self.frame_seqlen + i * self.frame_seqlen * self.num_frame_per_block for i in range(num_blocks)]
         noisy_image_block_starts = [self.frame_seqlen + i * self.frame_seqlen * self.num_frame_per_block for i in range(num_blocks)]
         noisy_image_block_ends = [start + self.frame_seqlen * self.num_frame_per_block for start in noisy_image_block_starts]
         state_block_starts = [i * self.num_state_per_block for i in range(num_blocks)]
@@ -793,14 +804,20 @@ class CausalWanSelfAttention(nn.Module):
         kv_cache: torch.Tensor | None = None,
         current_start_frame: int = 0,
         is_tf: bool = True,
+        freqs_clean: torch.Tensor | None = None,
+        num_retrieved_frames: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         r"""
         Args:
             x(Tensor): Shape [B, L, num_heads, C / num_heads]
             seq_lens(Tensor): Shape [B]
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
+            freqs_clean(Tensor): RoPE freqs for the (possibly longer) clean half when a
+                retrieved prefix is present; defaults to `freqs` when None (R=0).
+            num_retrieved_frames(int): R = K*X clean demo frames prepended to the clean half.
         """
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
+        R_tok = int(num_retrieved_frames) * self.frame_seqlen
 
         # query, key, value function
         def qkv_fn(x):
@@ -816,11 +833,16 @@ class CausalWanSelfAttention(nn.Module):
         if kv_cache is None:
             if is_tf:
                 # Teacher forcing training.
+                # Clean half = [retrieved prefix (R frames) | original clean (T_lat)] and the
+                # noisy half = [original noisy (T_lat) | action | state]. With R>0 the two halves
+                # differ in length by R_tok, so split explicitly (R=0 -> the old (s-arl)//2 split).
                 if action_register_length is not None:
-                    q_context = q[:, :(s-action_register_length)//2]
-                    k_context = k[:, :(s-action_register_length)//2]
-                    q_noisy = q[:, (s-action_register_length)//2:]  
-                    k_noisy = k[:, (s-action_register_length)//2:]
+                    noisy_image_len = (s - action_register_length - R_tok) // 2
+                    clean_len = noisy_image_len + R_tok
+                    q_context = q[:, :clean_len]
+                    k_context = k[:, :clean_len]
+                    q_noisy = q[:, clean_len:]
+                    k_noisy = k[:, clean_len:]
                 else:
                     q_context = q[:, :s//2]
                     k_context = k[:, :s//2]
@@ -832,14 +854,14 @@ class CausalWanSelfAttention(nn.Module):
                 # rope should be same for clean and noisy parts
                 rq_context = rope_action_apply(
                     x=q_context,
-                    freqs=freqs,
+                    freqs=(freqs_clean if freqs_clean is not None else freqs),
                     freqs_action=freqs_action,
                     freqs_state=freqs_state,
                     action_register_length=None,
                 ).type_as(v)
                 rk_context = rope_action_apply(
                     x=k_context,
-                    freqs=freqs,
+                    freqs=(freqs_clean if freqs_clean is not None else freqs),
                     freqs_action=freqs_action,
                     freqs_state=freqs_state,
                     action_register_length=None,
@@ -872,54 +894,51 @@ class CausalWanSelfAttention(nn.Module):
                 roped_query = torch.cat(roped_query, dim=1)
                 roped_key = torch.cat(roped_key, dim=1)
                 # Calculate sequence dimensions
-                half_seq_len = (s - (action_register_length if action_register_length is not None else 0)) // 2
-                
+
                 if action_register_length is not None:
                     # Teacher forcing structure:
-                    # Clean half: [image tokens only]
+                    # Clean half: [retrieved prefix (R frames) | original clean image tokens]
                     # Noisy half: [image tokens][action tokens][state tokens]
-                    # Causality only applies to image blocks!
-                    
-                    # Clean half contains ONLY image tokens
-                    clean_image_seq_len = half_seq_len
+                    # Causality + the action/state register count are anchored to the NOISY
+                    # frames (T_lat), so the retrieved prefix does not change block alignment.
+                    noisy_image_seq_len = (s - action_register_length - R_tok) // 2
+                    clean_image_seq_len = noisy_image_seq_len + R_tok
                     clean_frames = clean_image_seq_len // self.frame_seqlen
-                    
-                    # Noisy half contains image + action + state tokens
-                    noisy_image_seq_len = half_seq_len
                     noisy_frames = noisy_image_seq_len // self.frame_seqlen
                     num_image_blocks = (noisy_frames - 1) // self.num_frame_per_block
                     action_horizon = num_image_blocks * self.num_action_per_block
                     state_horizon = num_image_blocks * self.num_state_per_block
-                    
+
                     # Block layout must match actual register length. For 5B use 320x176 so latent frame_seqlen=55.
-                    if roped_query.shape[1] != half_seq_len + noisy_image_seq_len + action_horizon + state_horizon:
+                    if roped_query.shape[1] != clean_image_seq_len + noisy_image_seq_len + action_horizon + state_horizon:
                         raise ValueError(
                             "Sequence length does not match block layout. "
                             "For 5B use 320x176 (e.g. data=dreamzero/droid_relative_wan22 or image_resolution_width=320, image_resolution_height=176). "
                             f"Got noisy_frames={noisy_frames}, num_image_blocks={num_image_blocks}, "
-                            f"action_register_length={action_register_length}. "
+                            f"action_register_length={action_register_length}, num_retrieved_frames={num_retrieved_frames}. "
                             "Ensure (noisy_frames - 1) // num_frame_per_block >= 1 and register length equals "
                             "num_blocks * (num_action_per_block + num_state_per_block)."
                         )
-                    
+
                     # Split clean and noisy parts
-                    # Clean: [image tokens only]
+                    # Clean: [retrieved prefix | original clean image tokens]
                     clean_image_q = roped_query[:, :clean_image_seq_len]
                     clean_image_k = roped_key[:, :clean_image_seq_len]
                     clean_image_v = v[:, :clean_image_seq_len]
 
-                    # Noisy: [image tokens][action tokens][state tokens]
-                    noisy_image_q = roped_query[:, half_seq_len:half_seq_len + noisy_image_seq_len]
-                    noisy_action_q = roped_query[:, half_seq_len + noisy_image_seq_len:half_seq_len + noisy_image_seq_len + action_horizon]
-                    noisy_state_q = roped_query[:, half_seq_len + noisy_image_seq_len + action_horizon:]
-                    
-                    noisy_image_k = roped_key[:, half_seq_len:half_seq_len + noisy_image_seq_len]
-                    noisy_action_k = roped_key[:, half_seq_len + noisy_image_seq_len:half_seq_len + noisy_image_seq_len + action_horizon]
-                    noisy_state_k = roped_key[:, half_seq_len + noisy_image_seq_len + action_horizon:]
-                    
-                    noisy_image_v = v[:, half_seq_len:half_seq_len + noisy_image_seq_len]
-                    noisy_action_v = v[:, half_seq_len + noisy_image_seq_len:half_seq_len + noisy_image_seq_len + action_horizon]
-                    noisy_state_v = v[:, half_seq_len + noisy_image_seq_len + action_horizon:]
+                    # Noisy: [image tokens][action tokens][state tokens] (starts AFTER the clean half)
+                    n0 = clean_image_seq_len
+                    noisy_image_q = roped_query[:, n0:n0 + noisy_image_seq_len]
+                    noisy_action_q = roped_query[:, n0 + noisy_image_seq_len:n0 + noisy_image_seq_len + action_horizon]
+                    noisy_state_q = roped_query[:, n0 + noisy_image_seq_len + action_horizon:]
+
+                    noisy_image_k = roped_key[:, n0:n0 + noisy_image_seq_len]
+                    noisy_action_k = roped_key[:, n0 + noisy_image_seq_len:n0 + noisy_image_seq_len + action_horizon]
+                    noisy_state_k = roped_key[:, n0 + noisy_image_seq_len + action_horizon:]
+
+                    noisy_image_v = v[:, n0:n0 + noisy_image_seq_len]
+                    noisy_action_v = v[:, n0 + noisy_image_seq_len:n0 + noisy_image_seq_len + action_horizon]
+                    noisy_state_v = v[:, n0 + noisy_image_seq_len + action_horizon:]
                     
                     # ========== Process CLEAN (context) image tokens ==========
                     # Clean images: simple blockwise causal attention (no action/state)
@@ -932,15 +951,17 @@ class CausalWanSelfAttention(nn.Module):
                         noisy_image_q, noisy_image_k, noisy_image_v,
                         clean_image_k, clean_image_v,
                         noisy_action_k, noisy_action_v, noisy_state_k, noisy_state_v,
-                        noisy_frames, action_horizon, state_horizon)
-                    
+                        noisy_frames, action_horizon, state_horizon,
+                        clean_prefix_tokens=R_tok)
+
                     # Noisy action blocks: attend to previous clean image blocks (including first) + current noisy image + current noisy action + same state
                     noisy_action_outputs = self._process_noisy_action_blocks(
                         noisy_action_q, noisy_action_k, noisy_action_v,
-                        clean_image_k, clean_image_v, 
+                        clean_image_k, clean_image_v,
                         noisy_image_k, noisy_image_v,
                         noisy_state_k, noisy_state_v,
-                        noisy_frames, action_horizon, state_horizon)
+                        noisy_frames, action_horizon, state_horizon,
+                        clean_prefix_tokens=R_tok)
                     
                     # Noisy state blocks: self-attention only
                     noisy_state_outputs = self._process_state_blocks(
@@ -1161,6 +1182,8 @@ class CausalWanAttentionBlock(nn.Module):
         crossattn_cache: torch.Tensor | None = None,
         current_start_frame: int = 0,
         is_tf: bool = True,
+        freqs_clean: torch.Tensor | None = None,
+        num_retrieved_frames: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         r"""
         Args:
@@ -1194,6 +1217,8 @@ class CausalWanAttentionBlock(nn.Module):
             kv_cache=kv_cache,
             is_tf=is_tf,
             current_start_frame=current_start_frame,
+            freqs_clean=freqs_clean,
+            num_retrieved_frames=num_retrieved_frames,
         )
         x = x + (y * e[2].squeeze(2))
 
@@ -1290,7 +1315,10 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                  diffusion_model_pretrained_path=None,
                  num_action_per_block=32,
                  num_state_per_block=1,
-                 concat_first_frame_latent=True):
+                 concat_first_frame_latent=True,
+                 enable_retrieved_context=False,
+                 num_retrieved_demos=0,
+                 frames_per_demo=0):
         r"""
         Initialize the diffusion model backbone.
 
@@ -1361,6 +1389,17 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         self.num_action_per_block = num_action_per_block
         self.num_state_per_block = num_state_per_block
         self.concat_first_frame_latent = concat_first_frame_latent
+
+        # RICL-style retrieved-frame grounding: prepend num_retrieved_frames = K*X clean
+        # demo latent frames to the CLEAN (teacher-forcing) video half so generated frames
+        # attend to them as always-visible conditioning. 0 -> stock DreamZero (bit-identical).
+        self.enable_retrieved_context = bool(enable_retrieved_context)
+        self.num_retrieved_demos = int(num_retrieved_demos)
+        self.frames_per_demo = int(frames_per_demo)
+        self.num_retrieved_frames = (
+            self.num_retrieved_demos * self.frames_per_demo
+            if self.enable_retrieved_context else 0
+        )
 
         max_num_embodiments = 1
 
@@ -2009,6 +2048,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         action=None,
         state=None,
         embodiment_id=None,
+        num_retrieved_frames: int = 0,
     ):
         r"""
         Forward pass through the diffusion model
@@ -2042,10 +2082,17 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         x = self.patch_embedding(x)
 
         grid_size = torch.tensor(x.shape[2:], dtype=torch.long)
-        freqs = self._create_freqs(
-            grid_size=grid_size,
+        # RoPE: retrieved prefix frames take early positions 0..R-1; the (original) clean and
+        # noisy frames share aligned positions R..R+T_lat-1. freqs_clean spans the full clean
+        # half (R+T_lat frames); the noisy half reuses its tail. R=0 -> stock behavior.
+        R = int(num_retrieved_frames)
+        f_noisy, h_grid, w_grid = grid_size.tolist()
+        tokens_per_frame = h_grid * w_grid
+        freqs_clean = self._create_freqs(
+            grid_size=torch.tensor([f_noisy + R, h_grid, w_grid], dtype=torch.long),
             start_frame=0,
         )
+        freqs = freqs_clean[R * tokens_per_frame:]
 
         x = x.flatten(start_dim=2).transpose(1, 2)
         assert x.shape[1] == seq_len
@@ -2099,17 +2146,20 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                 clean_x = torch.cat([clean_x, y.to(dtype=clean_x.dtype)], dim=1)
             clean_x = self.patch_embedding(clean_x)
             clean_x = clean_x.flatten(start_dim=2).transpose(1, 2)
-            assert clean_x.shape[1] == seq_len
+            # Clean half = [retrieved prefix (R frames) | original clean (T_lat frames)].
+            clean_len = seq_len + R * tokens_per_frame
+            assert clean_x.shape[1] == clean_len, (clean_x.shape, clean_len, R)
 
             x = torch.cat([clean_x, x], dim=1)
 
+            # Clean (teacher-forcing) frames AND the retrieved prefix are all "clean": timestep 0.
             if aug_t is None:
-                aug_t = torch.zeros_like(timestep_original)
+                aug_t = torch.zeros((B, clean_len), device=x.device, dtype=timestep_original.dtype)
             assert aug_t is not None
 
             e_clean = self.time_embedding(
                 sinusoidal_embedding_1d(self.freq_dim, aug_t.flatten()).type_as(x))
-            e_clean = e_clean.unflatten(dim=0, sizes=timestep_original.shape)
+            e_clean = e_clean.unflatten(dim=0, sizes=(aug_t.shape[0], aug_t.shape[1]))
             e0_clean = self.time_projection(e_clean)
             e0_clean = e0_clean.unflatten(dim=2, sizes=(6, self.dim))
             e0 = torch.cat([e0_clean, e0], dim=1)
@@ -2118,6 +2168,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         kwargs = dict(
             e=e0,
             freqs=freqs,
+            freqs_clean=freqs_clean,
+            num_retrieved_frames=R,
             freqs_action=self.freqs_action,
             freqs_state=self.freqs_state,
             action_register_length=action_register_length,
@@ -2140,7 +2192,11 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                     use_reentrant=False,
                 )
             else:
-                x = block(x, **kwargs)
+                # block returns (x, updated_kv_cache); unpack so the no-grad / no-checkpointing
+                # path (e.g. held-out loss eval) works. The gradient-checkpointing branch above
+                # unpacks via create_custom_forward; this else branch was previously only reached
+                # with grad+checkpointing off, so the missing unpack stayed latent.
+                x, _ = block(x, **kwargs)
 
         if clean_x is not None:
             x = x[:, clean_x.shape[1]:]
