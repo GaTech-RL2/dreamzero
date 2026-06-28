@@ -346,3 +346,8 @@ class EmbodimentTag(Enum):
     """
     The Mecka robot with hands.
     """
+
+    PUSHT = "pusht"
+    """
+    The PushT planar pushing task (single top-down RGB view, 2D target-position action).
+    """

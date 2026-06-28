@@ -277,14 +277,26 @@ def get_frames_by_indices(
     elif video_backend == "opencv":
         frames = []
         cap = cv2.VideoCapture(video_path, **video_backend_kwargs)
-        for idx in indices:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        # Decode sequentially: per-frame POS_FRAMES seeking forces a keyframe re-decode on every
+        # call (pathologically slow for long GOPs). One forward pass gathers all requested indices.
+        # OpenCV decodes BGR; convert to RGB to match the decord/ffmpeg/torchcodec backends.
+        indices = np.asarray(indices).astype(int)
+        need = set(indices.tolist())
+        max_idx = int(indices.max()) if len(indices) else -1
+        decoded: dict[int, np.ndarray] = {}
+        cur = 0
+        while cur <= max_idx:
             ret, frame = cap.read()
             if not ret:
-                raise ValueError(f"Unable to read frame at index {idx}")
-            frames.append(frame)
+                break
+            if cur in need:
+                decoded[cur] = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            cur += 1
         cap.release()
-        frames = np.array(frames)
+        missing = [i for i in indices.tolist() if i not in decoded]
+        if missing:
+            raise ValueError(f"Unable to read frames at indices {missing} from {video_path}")
+        frames = np.array([decoded[i] for i in indices.tolist()])
         return frames
     else:
         raise NotImplementedError
@@ -384,14 +396,26 @@ def get_frames_by_timestamps(
         # Map each requested timestamp to the closest frame index
         indices = np.abs(frame_ts - timestamps).argmin(axis=0)
         frames = []
-        for idx in indices:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        # Decode sequentially: per-frame POS_FRAMES seeking forces a keyframe re-decode on every
+        # call (pathologically slow for long GOPs). One forward pass gathers all requested indices.
+        # OpenCV decodes BGR; convert to RGB to match the decord/ffmpeg/torchcodec backends.
+        indices = np.asarray(indices).astype(int)
+        need = set(indices.tolist())
+        max_idx = int(indices.max()) if len(indices) else -1
+        decoded: dict[int, np.ndarray] = {}
+        cur = 0
+        while cur <= max_idx:
             ret, frame = cap.read()
             if not ret:
-                raise ValueError(f"Unable to read frame at index {idx}")
-            frames.append(frame)
+                break
+            if cur in need:
+                decoded[cur] = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            cur += 1
         cap.release()
-        frames = np.array(frames)
+        missing = [i for i in indices.tolist() if i not in decoded]
+        if missing:
+            raise ValueError(f"Unable to read frames at indices {missing} from {video_path}")
+        frames = np.array([decoded[i] for i in indices.tolist()])
         return frames
 
     elif video_backend == "torchvision_av":

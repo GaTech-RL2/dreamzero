@@ -245,3 +245,15 @@ groot/control/envs/yam/data/eval/*
 
 checkpoints/
 video_pred_output*/
+
+# Slurm job stdout logs (sbatch --output=%x_%j.out lands these at the launch dir)
+*.out
+
+# Rendered eval / prediction videos
+*.mp4
+
+# PushT eval run outputs (per-seed videos, logs, summaries)
+eval_out/
+
+# NFS silly-rename temp files (deleted-but-still-open files)
+.nfs*
