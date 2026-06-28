@@ -219,6 +219,14 @@ class DreamTransform(InvertibleModalityTransform):
     state_horizon: int
     action_horizon: int
     num_views: int = 3
+    fixed_num_chunks: Optional[int] = Field(
+        default=None,
+        description=(
+            "If set, force exactly this many causal chunks per sample by truncating (or padding) the "
+            "aligned video/state/action arrays, so all samples share one shape and per-device batch>1 "
+            "works. None = native variable-length behavior (only safe at per-device batch 1)."
+        ),
+    )
 
     # Add tokenizer attribute
     tokenizer_path: str = Field(
@@ -505,8 +513,49 @@ class DreamTransform(InvertibleModalityTransform):
 
         return actions, actions_mask, n_action_tokens
 
+    def _force_fixed_chunks(self, data: dict, num_chunks: int) -> dict:
+        """Force exactly `num_chunks` causal chunks so samples are uniformly shaped (enables
+        per-device batch>1). The video/state/action arrays are already temporally aligned: video has
+        (frames_per_chunk*K + 1) frames on axis 0, state has state_horizon*K tokens, action has
+        action_horizon*K rows. We keep the earliest K chunks (consistent across modalities); if the
+        sample has fewer chunks than requested (very short window) we pad by repeating the last chunk.
+        """
+        state = data.get("state")
+        if state is None or state.shape[0] == 0:
+            return data
+        k_cur = state.shape[0] // self.state_horizon
+        if k_cur == num_chunks or k_cur == 0:
+            return data
+        data = dict(data)
+        video = data["video"]
+        frames_per_chunk = (video.shape[0] - 1) // k_cur  # video frames = fpc*K + 1
+        vframes = frames_per_chunk * num_chunks + 1
+        srows = self.state_horizon * num_chunks
+        arows = self.action_horizon * num_chunks
+
+        def _fit(arr, n):
+            if arr is None or arr.shape[0] == n:
+                return arr
+            if arr.shape[0] > n:  # truncate to the earliest n rows (earliest chunks)
+                return arr[:n]
+            pad = np.repeat(arr[-1:], n - arr.shape[0], axis=0)  # repeat last chunk (rare)
+            return np.concatenate([arr, pad], axis=0)
+
+        data["video"] = _fit(video, vframes)
+        data["state"] = _fit(state, srows)
+        if "action" in data:
+            data["action"] = _fit(data["action"], arows)
+        return data
+
     def apply_single(self, data: dict) -> dict:
         transformed_data = {}
+
+        # Force a fixed number of causal chunks (uniform shapes) so per-device batch>1 can collate.
+        # TRAINING-ONLY: at inference the policy feeds a single causal step, and padding it to K chunks
+        # corrupts the state/video length (e.g. state 1->2 timesteps => action_register_length 26!=25,
+        # crashing the causal RoPE assertion). fixed_num_chunks is purely a training batching toggle.
+        if self.training and self.fixed_num_chunks is not None:
+            data = self._force_fixed_chunks(data, int(self.fixed_num_chunks))
 
         # 1) Prepare video and language with vlm processing.
         images = self._prepare_video(data)

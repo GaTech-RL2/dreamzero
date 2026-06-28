@@ -16,11 +16,13 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 
 os.environ.setdefault("ATTENTION_BACKEND", "torch")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 import numpy as np
+import cv2
 import torch
 import torch.distributed as dist
 import gymnasium as gym
@@ -33,6 +35,55 @@ from groot.vla.model.n1_5.sim_policy import GrootSimPolicy
 from groot.vla.data.schema.embodiment_tags import EmbodimentTag
 
 TASK_TEXT = "push the T-shaped block to the target goal"
+
+
+def derive_wandb_run_id(model_path):
+    """Map a checkpoint path back to the training run's wandb id.
+
+    sbatch_pusht.sh sets WANDB_RUN_ID=dzpusht_${SIZE//./p}, where the output dir is
+    checkpoints/dreamzero_pusht_<SIZE>. So .../dreamzero_pusht_300m/checkpoint-N -> dzpusht_300m
+    and .../dreamzero_pusht_1.3b/checkpoint-N -> dzpusht_1p3b.
+    """
+    for part in os.path.normpath(model_path).split(os.sep):
+        if part.startswith("dreamzero_pusht_"):
+            size = part[len("dreamzero_pusht_"):]
+            return "dzpusht_" + size.replace(".", "p")
+    return None
+
+
+def derive_step(model_path):
+    """checkpoint-12000 -> 12000 (the trainer global_step), else None."""
+    m = re.match(r"checkpoint-(\d+)", os.path.basename(os.path.normpath(model_path)))
+    return int(m.group(1)) if m else None
+
+
+def log_eval_to_wandb(summary, step, run_id, entity=None, project=None):
+    """Append eval metrics to the training run on a custom `eval/step` x-axis.
+
+    Eval lags training (it runs on a checkpoint while training has moved on), so we DON'T pass a
+    wandb step — we let wandb auto-increment its internal step and plot eval/* against the custom
+    `eval/step` metric (the checkpoint's global_step). This avoids any "step must increase" conflict
+    with the trainer logging concurrently to the same run, and places each point at its true step.
+    Resuming the (live) training run from this separate process is the standard async-eval pattern;
+    finishing here only flushes our handle — the trainer keeps logging to the same run unaffected.
+    """
+    import wandb
+
+    entity = entity or os.environ.get("WANDB_ENTITY", "rl2-group")
+    project = project or os.environ.get("WANDB_PROJECT", "world-value")
+    wandb.init(entity=entity, project=project, id=run_id, resume="allow",
+               settings=wandb.Settings(silent=True))
+    wandb.define_metric("eval/step")
+    wandb.define_metric("eval/*", step_metric="eval/step")
+    wandb.log({
+        "eval/step": int(step),
+        "eval/success_rate": float(summary["success_rate"]),
+        "eval/mean_score": float(summary["mean_score"]),
+        "eval/mean_coverage": float(summary["mean_max_coverage"]),
+        "eval/num_episodes": int(summary["num_episodes"]),
+    })
+    wandb.finish()
+    print(f"[eval] logged to wandb {entity}/{project} run={run_id} at eval/step={step}")
 
 
 def _bump_recompile_limit():
@@ -118,6 +169,48 @@ def decode_pred_video(policy, pred_latents):
         return None
 
 
+def _resample_indices(src_len, out_len):
+    """Nearest-neighbor index map from an `out_len` timeline onto a `src_len` track (both span [0,1])."""
+    if src_len <= 1 or out_len <= 1:
+        return [0] * out_len
+    return [round(i * (src_len - 1) / (out_len - 1)) for i in range(out_len)]
+
+
+def _resize_h(frame, height):
+    """Resize an (H,W,3) uint8 frame to `height`, preserving aspect ratio."""
+    h, w = frame.shape[:2]
+    width = max(1, int(round(w * height / h)))
+    interp = cv2.INTER_AREA if height < h else cv2.INTER_NEAREST
+    return cv2.resize(frame, (width, height), interpolation=interp)
+
+
+def make_side_by_side(dream_frames, env_frames, height=512, labels=("DREAM (imagined)", "ACTUAL")):
+    """Align the dreamed and actual rollouts on a common start->end timeline and h-stack them.
+
+    The tracks have different frame counts (the dream is 4x temporal-upsampled latent; the env is one
+    render per sim step) but both span the whole episode, so each is resampled to a shared length by
+    nearest-neighbor on normalized time -- so column i shows "what the model imagined at time t" beside
+    "what actually happened at time t". Panels are resized to a common height with a white divider and a
+    text label. Returns a list of (height, W_dream+4+W_env, 3) uint8 RGB frames, or None.
+    """
+    if not dream_frames or not env_frames:
+        return None
+    out_len = max(len(dream_frames), len(env_frames))
+    di = _resample_indices(len(dream_frames), out_len)
+    ei = _resample_indices(len(env_frames), out_len)
+    sep = np.full((height, 4, 3), 255, dtype=np.uint8)  # white divider
+    out = []
+    for i in range(out_len):
+        d = _resize_h(np.ascontiguousarray(dream_frames[di[i]]), height)
+        e = _resize_h(np.ascontiguousarray(env_frames[ei[i]]), height)
+        if labels:
+            # frames are RGB (imageio order): (255,255,0)=yellow, (0,255,0)=green
+            cv2.putText(d, labels[0], (8, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2, cv2.LINE_AA)
+            cv2.putText(e, labels[1], (8, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
+        out.append(np.concatenate([d, sep, e], axis=1))
+    return out
+
+
 def rollout(policy, env, seed, n_action_steps, max_steps, n_pred_chunks):
     adapter = PushTAdapter()
     obs, info = env.reset(seed=seed)
@@ -130,7 +223,8 @@ def rollout(policy, env, seed, n_action_steps, max_steps, n_pred_chunks):
 
     while steps < max_steps and not done:
         rb, video_pred = policy.lazy_joint_forward_causal(Batch(obs=adapter.to_model_obs(obs)))
-        if len(pred_latents) < n_pred_chunks and video_pred is not None:
+        # n_pred_chunks < 0 => keep every imagined chunk (the full dreamed rollout); >=0 caps for speed.
+        if video_pred is not None and (n_pred_chunks < 0 or len(pred_latents) < n_pred_chunks):
             pred_latents.append(video_pred)
         actions = adapter.from_model_action(rb.act)  # (horizon, 2)
         for a in actions[:n_action_steps]:
@@ -155,7 +249,16 @@ def main():
     p.add_argument("--output_dir", default=None)
     p.add_argument("--device", default="cuda:0")
     p.add_argument("--save_pred_video", action="store_true")
-    p.add_argument("--n_pred_chunks", type=int, default=6, help="cap predicted-video inferences to decode")
+    p.add_argument("--n_pred_chunks", type=int, default=-1,
+                   help="cap imagined chunks to decode; -1 = all (the full dreamed rollout)")
+    p.add_argument("--save_compare", action=argparse.BooleanOptionalAction, default=True,
+                   help="write seedN_compare.mp4 (dream | actual, aligned side-by-side) -- the default output")
+    p.add_argument("--save_env", action="store_true", help="also write the standalone actual-rollout mp4 (off by default)")
+    p.add_argument("--save_pred", action="store_true", help="also write the standalone dreamed mp4 (off by default)")
+    p.add_argument("--compare_height", type=int, default=512, help="panel height for the compare video")
+    p.add_argument("--wandb", action="store_true", help="log eval/* metrics to the training wandb run")
+    p.add_argument("--wandb_run_id", default=None, help="override (default: derived from model_path)")
+    p.add_argument("--wandb_step", type=int, default=None, help="override (default: checkpoint step)")
     args = p.parse_args()
 
     if not torch.cuda.is_available():
@@ -196,13 +299,23 @@ def main():
         results.append({"seed": seed, "max_coverage": max_cov, "score": score, "success": bool(success)})
         print(f"[eval] seed {seed}: max_coverage={max_cov:.3f} score={score:.3f} success={success}")
 
-        imageio.mimsave(os.path.join(out_dir, f"seed{seed}_env.mp4"),
-                        render_frames, fps=10, codec="libx264", macro_block_size=1)
+        # Video viz: by default ONLY the aligned dream|actual compare is written; the standalone
+        # env/pred mp4s are opt-in (--save_env/--save_pred) to save disk.
         if args.save_pred_video:
             pred = decode_pred_video(policy, pred_latents)
             if pred:
-                imageio.mimsave(os.path.join(out_dir, f"seed{seed}_pred.mp4"),
-                                pred, fps=5, codec="libx264", macro_block_size=1)
+                print(f"[eval] seed {seed}: dreamed {len(pred)} frames over {len(render_frames)} env frames")
+                if args.save_compare:
+                    comp = make_side_by_side(pred, render_frames, height=args.compare_height)
+                    if comp:
+                        imageio.mimsave(os.path.join(out_dir, f"seed{seed}_compare.mp4"),
+                                        comp, fps=10, codec="libx264", macro_block_size=1)
+                if args.save_pred:  # fps 10 matches env so the dream plays on the rollout timeline
+                    imageio.mimsave(os.path.join(out_dir, f"seed{seed}_pred.mp4"),
+                                    pred, fps=10, codec="libx264", macro_block_size=1)
+        if args.save_env:
+            imageio.mimsave(os.path.join(out_dir, f"seed{seed}_env.mp4"),
+                            render_frames, fps=10, codec="libx264", macro_block_size=1)
 
     success_rate = float(np.mean([r["success"] for r in results]))
     mean_score = float(np.mean([r["score"] for r in results]))
@@ -220,6 +333,17 @@ def main():
     print(f"[eval] mean_score                       = {mean_score:.3f}")
     print(f"[eval] mean_max_coverage                = {mean_cov:.3f}")
     print(f"[eval] summary -> {os.path.join(out_dir, 'summary.json')}")
+
+    if args.wandb:
+        run_id = args.wandb_run_id or derive_wandb_run_id(args.model_path)
+        step = args.wandb_step if args.wandb_step is not None else derive_step(args.model_path)
+        if run_id is None or step is None:
+            print(f"[eval] WARN: could not derive wandb run_id/step from {args.model_path}; skipping wandb log")
+        else:
+            try:
+                log_eval_to_wandb(summary, step, run_id)
+            except Exception as e:  # noqa: BLE001  — never let wandb break eval
+                print(f"[eval] WARN: wandb logging failed: {e}")
 
 
 if __name__ == "__main__":

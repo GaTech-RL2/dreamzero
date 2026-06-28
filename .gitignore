@@ -163,7 +163,8 @@ cython_debug/
 
 # log
 outputs/
-logs/
+logs/*
+!logs/.gitkeep
 *logs_rl*
 !external_dependencies/OpenHomie/HomieRL/legged_gym/logs/exported/policies/*.onnx
 

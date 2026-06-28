@@ -28,6 +28,9 @@ num_visual_tokens_per_frame: 16
 max_state_dim: 44
 max_action_dim: 32
 language_dropout_prob: 0.0
+# If set (e.g. 2), force exactly this many causal chunks per sample so per-device batch>1 collates
+# (uniform shapes). null = native variable-length sampling (per-device batch 1 only).
+fixed_num_chunks: null
 
 
 model_specific_transform:
@@ -40,5 +43,6 @@ model_specific_transform:
   max_length: ${max_length}
   state_horizon: ${state_horizon}
   action_horizon: ${action_horizon}
+  fixed_num_chunks: ${fixed_num_chunks}
   embodiment_tag_mapping: ${embodiment_tag_to_projector_index}
   tokenizer_path: ${tokenizer_path}

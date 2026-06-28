@@ -54,6 +54,7 @@ if [ ! -d "$WAN21_CKPT_DIR" ]; then echo "ERROR: Wan2.1-I2V-14B-480P (frozen T5/
     num_action_per_block=24 \
     num_state_per_block=1 \
     frame_seqlen=256 \
+    fixed_num_chunks=${FIXED_NUM_CHUNKS:-null} \
     image_resolution_width=256 \
     image_resolution_height=256 \
     seed=42 \

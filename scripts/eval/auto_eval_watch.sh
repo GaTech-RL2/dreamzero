@@ -13,7 +13,7 @@ touch "$STATE"
 [ -f "$CURVE" ] || printf "model\tstep\tsuccess_rate\tmean_score\tmean_coverage\n" > "$CURVE"
 
 while true; do
-  for model in dreamzero_pusht_300m dreamzero_pusht_1.3b; do
+  for model in dreamzero_pusht_300m dreamzero_pusht_1.3b dreamzero_pusht_1.3b_lora dreamzero_pusht_5b_lora dreamzero_pusht_1.3b_ft; do
     d="$ROOT/checkpoints/$model"
     [ -d "$d" ] || continue
     for ckpt in "$d"/checkpoint-*; do
@@ -28,9 +28,15 @@ while true; do
       [ -f "$ckpt/experiment_cfg/metadata.json" ] || continue
       key="sub:$model:$step"
       grep -qF "$key" "$STATE" && continue
-      echo "$key" >> "$STATE"
+      # Record the marker ONLY on a successful submit (non-empty job id). Recording before submit means
+      # a transient sbatch failure (e.g. unresponsive SLURM controller -> empty job id) is never retried.
       jid=$(sbatch --parsable --exclude=sonny scripts/eval/sbatch_eval_pusht.sh "$ckpt" "$N_EP" 2>/dev/null || true)
-      echo "[autoeval] $(date +%H:%M) submitted $model step=$step job=$jid"
+      if [ -n "$jid" ]; then
+        echo "$key" >> "$STATE"
+        echo "[autoeval] $(date +%H:%M) submitted $model step=$step job=$jid"
+      else
+        echo "[autoeval] $(date +%H:%M) SUBMIT FAILED $model step=$step (SLURM busy?) -- will retry next loop"
+      fi
     done
   done
   # Aggregate completed summaries into the curve (once each).

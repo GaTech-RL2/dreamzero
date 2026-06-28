@@ -5,7 +5,7 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=80G
 #SBATCH --time=02:00:00
-#SBATCH --output=%x_%j.out
+#SBATCH --output=logs/%x_%j.out   # SLURM won't mkdir this; launch from repo root where logs/ exists
 #
 # Evaluate a DreamZero PushT checkpoint on gym-pusht (coverage success + env/pred mp4s).
 #   sbatch scripts/eval/sbatch_eval_pusht.sh <checkpoint_dir> [num_episodes]
@@ -25,7 +25,13 @@ if [ ! -f "$CKPT/config.json" ]; then
 fi
 echo "=== evaluating $CKPT ($N episodes) ==="
 
+# Log eval/* to the training wandb run (same entity/project as sbatch_pusht.sh). WANDB_EVAL=0 disables.
+export WANDB_ENTITY="${WANDB_ENTITY:-rl2-group}"
+export WANDB_PROJECT="${WANDB_PROJECT:-world-value}"
+WANDB_FLAG=""
+[ "${WANDB_EVAL:-1}" = "1" ] && WANDB_FLAG="--wandb"
+
 .venv/bin/python scripts/eval/run_pusht_eval.py \
   --model_path "$CKPT" --num_episodes "$N" \
   --n_action_steps "${N_ACTION_STEPS:-8}" --max_steps "${MAX_STEPS:-300}" \
-  --save_pred_video
+  --save_pred_video $WANDB_FLAG
