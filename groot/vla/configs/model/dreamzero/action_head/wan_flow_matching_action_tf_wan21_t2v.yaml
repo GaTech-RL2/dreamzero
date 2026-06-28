@@ -1,0 +1,32 @@
+# @package _global_
+# Wan2.1-T2V-1.3B backbone config for DreamZero DROID training.
+# Pure text-to-video: in_dim=16, no CLIP image encoder, no first-frame latent concat.
+# Override base config with: model/dreamzero/action_head=wan_flow_matching_action_tf_wan21_t2v
+#
+# How this "accounts for text-to-video": a T2V backbone has no image input. DreamZero already
+# conditions on the current observation through its intrinsic, backbone-agnostic clean_x path
+# (clean observed latents fed through the causal DiT with a blockwise mask; is_tf=True in
+# wan_video_dit_action_casual_chunk.py). So observation conditioning rides clean_x + text
+# cross-attention; the I2V-only signals (first-frame latent concat `y`, CLIP `img_emb`) are
+# disabled. The pretrained 16-channel patch_embedding then loads exactly (no weight surgery).
+#
+# Same Wan2.1 VAE (z=16, 8x) / patch (1,2,2) / resolution (320x176) as the default Wan2.1 path,
+# so frame_seqlen stays 880 (inherited) and data=dreamzero/droid_relative is reused unchanged.
+
+defaults:
+  - wan_flow_matching_action_tf  # inherit base (VAE=WanVideoVAE z=16, frame_seqlen=880)
+
+action_head_cfg:
+  config:
+    image_encoder_cfg: null  # no CLIP image encoder for T2V
+    diffusion_model_cfg:
+      model_type: "t2v"                    # text-only cross-attn; no img_emb built
+      dim: 1536
+      in_dim: 16                           # latent only; matches checkpoint patch_embedding
+      out_dim: 16
+      concat_first_frame_latent: false     # do NOT concat first-frame latent
+      ffn_dim: 8960
+      freq_dim: 256
+      eps: 1e-6
+      num_heads: 12
+      num_layers: 30

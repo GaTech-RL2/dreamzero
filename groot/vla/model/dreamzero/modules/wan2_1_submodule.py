@@ -242,12 +242,15 @@ class WanSelfAttention(nn.Module):
 
 class WanT2VCrossAttention(WanSelfAttention):
 
-    def forward(self, x, context, context_lens, crossattn_cache=None):
+    def forward(self, x, context, context_lens=None, crossattn_cache=None):
         r"""
         Args:
             x(Tensor): Shape [B, L1, C]
             context(Tensor): Shape [B, L2, C]
-            context_lens(Tensor): Shape [B]
+            context_lens(Tensor, *optional*): Shape [B]. Defaults to None (attend to all context tokens,
+                matching WanI2VCrossAttention). CausalWanModel's block calls cross-attn as
+                self.cross_attn(norm3(x), context) without context_lens, so this must be optional for the
+                t2v backbone; padding tokens are already zeroed upstream in the action head's encode_prompt.
             crossattn_cache (List[dict], *optional*): Contains the cached key and value tensors for context embedding.
         """
         b, n, d = x.size(0), self.num_heads, self.head_dim

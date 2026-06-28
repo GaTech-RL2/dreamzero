@@ -181,6 +181,7 @@ groot/rl/data/
 .DS_Store
 sim_dependencies/
 .venv/*
+.hf_cache/
 
 
 # Mujoco

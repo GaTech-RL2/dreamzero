@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 
 WAN_HF_REPO_ID = "Wan-AI/Wan2.1-I2V-14B-480P"
 WAN22_HF_REPO_ID = "Wan-AI/Wan2.2-TI2V-5B"
+WAN21_T2V_HF_REPO_ID = "Wan-AI/Wan2.1-T2V-1.3B"
 
 
 def hf_download(filename: str, repo_id: str = WAN_HF_REPO_ID) -> str:
@@ -172,7 +173,18 @@ class WANPolicyHead(ActionHead):
         self.hidden_size = config.hidden_size
         self.num_frames = config.num_frames
         self.text_encoder = instantiate(config.text_encoder_cfg)
-        self.image_encoder = instantiate(config.image_encoder_cfg)
+        # CLIP image encoder is optional: pure text-to-video backbones (e.g. Wan2.1-T2V-1.3B) have no
+        # image conditioning and their DiT builds no img_emb (model_type='t2v'). When absent,
+        # first-frame/observation conditioning rides DreamZero's intrinsic clean_x causal path + text.
+        # Key the decision on BOTH the (nulled) image_encoder_cfg and the DiT model_type so a t2v
+        # backbone never instantiates/uses CLIP even if image_encoder_cfg was left set.
+        _dm_cfg = config.diffusion_model_cfg or {}
+        _model_type = _dm_cfg.get("model_type", None) if hasattr(_dm_cfg, "get") else getattr(_dm_cfg, "model_type", None)
+        self.image_encoder = (
+            instantiate(config.image_encoder_cfg)
+            if (config.image_encoder_cfg is not None and _model_type != "t2v")
+            else None
+        )
         self.vae = instantiate(config.vae_cfg)
         self.scheduler = FlowMatchScheduler(shift=5, sigma_min=0.0, extra_one_step=True)
         self.model_names = ['text_encoder']
@@ -239,21 +251,31 @@ class WANPolicyHead(ActionHead):
         self.action_horizon = config.action_horizon
         self.num_inference_timesteps = config.num_inference_timesteps
         
+        # Pure text-to-video backbone (Wan2.1-T2V-1.3B): no CLIP; its T5/VAE/DiT weights live in the T2V repo.
+        is_t2v = getattr(self.model, "model_type", None) == "t2v"
+
         text_enc_path = ensure_file(
             self.text_encoder.text_encoder_pretrained_path,
             "models_t5_umt5-xxl-enc-bf16.pth",
+            repo_id=WAN21_T2V_HF_REPO_ID if is_t2v else WAN_HF_REPO_ID,
         )
         self.text_encoder.load_state_dict(torch.load(text_enc_path, map_location='cpu'))
 
-        img_enc_path = ensure_file(
-            self.image_encoder.image_encoder_pretrained_path,
-            "models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth",
-        )
-        self.image_encoder.model.load_state_dict(torch.load(img_enc_path, map_location='cpu'), strict=False)
+        # CLIP image encoder is only present for I2V/TI2V backbones.
+        if self.image_encoder is not None:
+            img_enc_path = ensure_file(
+                self.image_encoder.image_encoder_pretrained_path,
+                "models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth",
+            )
+            self.image_encoder.model.load_state_dict(torch.load(img_enc_path, map_location='cpu'), strict=False)
 
-        # Wan2.2 (WanVideoVAE38, z_dim=48) uses Wan2.2_VAE.pth; Wan2.1 uses Wan2.1_VAE.pth
-        vae_hf_filename = "Wan2.2_VAE.pth" if getattr(self.vae, "z_dim", 16) == 48 else "Wan2.1_VAE.pth"
-        vae_repo_id = WAN22_HF_REPO_ID if getattr(self.vae, "z_dim", 16) == 48 else WAN_HF_REPO_ID
+        # VAE: Wan2.2 (WanVideoVAE38, z_dim=48) uses Wan2.2_VAE.pth from the 5B repo; Wan2.1 (z_dim=16)
+        # uses Wan2.1_VAE.pth from the T2V-1.3B repo when t2v, else from the 14B repo.
+        if getattr(self.vae, "z_dim", 16) == 48:
+            vae_hf_filename, vae_repo_id = "Wan2.2_VAE.pth", WAN22_HF_REPO_ID
+        else:
+            vae_hf_filename = "Wan2.1_VAE.pth"
+            vae_repo_id = WAN21_T2V_HF_REPO_ID if is_t2v else WAN_HF_REPO_ID
         vae_path = ensure_file(
             self.vae.vae_pretrained_path,
             vae_hf_filename,
@@ -263,15 +285,25 @@ class WANPolicyHead(ActionHead):
 
         if not config.skip_component_loading:
             dit_dir = self.model.diffusion_model_pretrained_path
-            # Wan2.2 (in_dim=48) uses Wan2.2-TI2V-5B repo; Wan2.1 uses Wan2.1-I2V-14B-480P
-            dit_repo_id = WAN22_HF_REPO_ID if getattr(self.model, "in_dim", 16) == 48 else WAN_HF_REPO_ID
+            # DiT repo: t2v -> Wan2.1-T2V-1.3B; in_dim=48 -> Wan2.2-TI2V-5B; else Wan2.1-I2V-14B-480P.
+            if is_t2v:
+                dit_repo_id = WAN21_T2V_HF_REPO_ID
+            elif getattr(self.model, "in_dim", 16) == 48:
+                dit_repo_id = WAN22_HF_REPO_ID
+            else:
+                dit_repo_id = WAN_HF_REPO_ID
             if dit_dir is None or not os.path.isdir(dit_dir):
-                index_path = hf_hub_download(repo_id=dit_repo_id, filename="diffusion_pytorch_model.safetensors.index.json")
-                dit_dir = os.path.dirname(index_path)
-                with open(index_path, 'r') as f:
-                    index = json.load(f)
-                for shard_file in set(index["weight_map"].values()):
-                    hf_hub_download(repo_id=dit_repo_id, filename=shard_file)
+                if is_t2v:
+                    # Wan2.1-T2V-1.3B ships a single safetensors file (no shard index).
+                    single_path = hf_hub_download(repo_id=dit_repo_id, filename="diffusion_pytorch_model.safetensors")
+                    dit_dir = os.path.dirname(single_path)
+                else:
+                    index_path = hf_hub_download(repo_id=dit_repo_id, filename="diffusion_pytorch_model.safetensors.index.json")
+                    dit_dir = os.path.dirname(index_path)
+                    with open(index_path, 'r') as f:
+                        index = json.load(f)
+                    for shard_file in set(index["weight_map"].values()):
+                        hf_hub_download(repo_id=dit_repo_id, filename=shard_file)
 
             if dit_dir is not None:
                 safetensors_path = os.path.join(dit_dir, "diffusion_pytorch_model.safetensors")
@@ -359,7 +391,8 @@ class WANPolicyHead(ActionHead):
             self.print_trainable_params()
 
         self.text_encoder.requires_grad_(False)
-        self.image_encoder.requires_grad_(False)
+        if self.image_encoder is not None:
+            self.image_encoder.requires_grad_(False)
         self.vae.requires_grad_(False)
         if not self.defer_lora_injection:
             self.print_trainable_params()
@@ -405,7 +438,8 @@ class WANPolicyHead(ActionHead):
             # self.model.time_modality_projection.requires_grad_(True)
             
             self.text_encoder.requires_grad_(False)
-            self.image_encoder.requires_grad_(False)
+            if self.image_encoder is not None:
+                self.image_encoder.requires_grad_(False)
             self.vae.requires_grad_(False)
             self.print_trainable_params()
         else:
@@ -421,7 +455,8 @@ class WANPolicyHead(ActionHead):
             if not self.tune_diffusion_model:
                 self.model.eval()
             self.text_encoder.eval()
-            self.image_encoder.eval()
+            if self.image_encoder is not None:
+                self.image_encoder.eval()
             self.vae.eval()
     
     
@@ -662,11 +697,16 @@ class WANPolicyHead(ActionHead):
         _, _, num_frames, height, width = videos.shape
         image = videos[:, :, :1].transpose(1, 2)
 
-        clip_feas, ys, _ = self.encode_image(image, num_frames, height, width)
+        # Pure T2V backbone (no CLIP image encoder): no first-frame CLIP/latent conditioning.
+        # Observation conditioning rides the intrinsic clean_x causal path (passed below) + text.
+        if self.image_encoder is not None:
+            clip_feas, ys, _ = self.encode_image(image, num_frames, height, width)
+            clip_feas = clip_feas.to(self._device)
+            ys = ys.to(self._device)
+        else:
+            clip_feas, ys = None, None
 
         latents = latents.to(self._device)
-        clip_feas = clip_feas.to(self._device)
-        ys = ys.to(self._device)
         prompt_embs = prompt_embs.to(self._device)
        
         # Loss
@@ -1063,11 +1103,24 @@ class WANPolicyHead(ActionHead):
             image = videos[:, :, :1].transpose(1, 2)
 
         if self.current_start_frame == 0:
-            clip_feas, ys, image = self.encode_image(image, self.num_frames, height, width)
-            self.clip_feas = clip_feas.to(dtype=image.dtype)
-            self.ys = ys.to(dtype=image.dtype)
-        
-        assert self.clip_feas is not None and self.ys is not None, "clip_feas and ys must be set"
+            if self.image_encoder is not None:
+                clip_feas, ys, image = self.encode_image(image, self.num_frames, height, width)
+                self.clip_feas = clip_feas.to(dtype=image.dtype)
+                self.ys = ys.to(dtype=image.dtype)
+            else:
+                # Pure T2V backbone: no CLIP / first-frame concat. Use the first-frame VAE latent as
+                # the clean reference for the causal warmup; clip_feas/ys stay None.
+                self._ensure_vae_on_device(image)
+                with torch.no_grad():
+                    image = self.vae.encode(
+                        image.transpose(1, 2),
+                        tiled=self.tiled,
+                        tile_size=(self.tile_size_height, self.tile_size_width),
+                        tile_stride=(self.tile_stride_height, self.tile_stride_width),
+                    )
+
+        # I2V/TI2V require clip_feas/ys; T2V leaves them None (observation rides clean_x + text).
+        assert self.image_encoder is None or (self.clip_feas is not None and self.ys is not None), "clip_feas and ys must be set"
 
         end_image_encoder_event.record()
 
@@ -1151,7 +1204,7 @@ class WANPolicyHead(ActionHead):
                 embodiment_id=None,
                 context=prompt_embs,
                 seq_len=frame_seqlen,
-                y=self.ys[:, :, 0:1],
+                y=None if self.ys is None else self.ys[:, :, 0:1],
                 clip_feature=self.clip_feas,
                 kv_caches=kv_caches,
                 crossattn_caches=crossattn_caches,
@@ -1166,7 +1219,9 @@ class WANPolicyHead(ActionHead):
 
         if self.current_start_frame != 1:
             current_ref_latents = image[:, -self.num_frame_per_block:]
-            if self.current_start_frame <= self.ys.shape[2]:
+            if self.ys is None:
+                y = None
+            elif self.current_start_frame <= self.ys.shape[2]:
                 y = self.ys[:, :, self.current_start_frame - self.num_frame_per_block : self.current_start_frame]
             else:
                 y = self.ys[:, :, -self.num_frame_per_block:]
@@ -1249,7 +1304,9 @@ class WANPolicyHead(ActionHead):
             should_run_model = self.should_run_model(index, current_timestep, prev_predictions)
             if should_run_model:
                 dit_compute_steps += 1
-                if self.current_start_frame + self.num_frame_per_block <= self.ys.shape[2]:
+                if self.ys is None:
+                    y = None
+                elif self.current_start_frame + self.num_frame_per_block <= self.ys.shape[2]:
                     y = self.ys[:, :, self.current_start_frame : self.current_start_frame + self.num_frame_per_block]
                 else:
                     y = self.ys[:, :, -self.num_frame_per_block:]
@@ -1353,7 +1410,8 @@ class WANPolicyHead(ActionHead):
         print("Moving models to the cuda device and setting the dtype to bfloat16.")
         self.model.to(device=self._device, dtype=torch.bfloat16)
         self.text_encoder.to(device=self._device, dtype=torch.bfloat16)
-        self.image_encoder.to(device=self._device, dtype=torch.bfloat16)
+        if self.image_encoder is not None:
+            self.image_encoder.to(device=self._device, dtype=torch.bfloat16)
         self.vae.to(device=self._device, dtype=torch.bfloat16)
         import os
         ENABLE_TENSORRT = os.getenv("ENABLE_TENSORRT", "False").lower() == "true"
@@ -1368,9 +1426,10 @@ class WANPolicyHead(ActionHead):
                 mode="reduce-overhead", fullgraph=True, dynamic=False,
             )(self.text_encoder.forward)
 
-            self.image_encoder.model.visual.forward = torch.compile(
-                mode="reduce-overhead", fullgraph=True, dynamic=False,
-            )(self.image_encoder.model.visual.forward)
+            if self.image_encoder is not None:
+                self.image_encoder.model.visual.forward = torch.compile(
+                    mode="reduce-overhead", fullgraph=True, dynamic=False,
+                )(self.image_encoder.model.visual.forward)
 
             self.vae.model.encode = torch.compile(
                 mode="reduce-overhead", fullgraph=True, dynamic=False,
