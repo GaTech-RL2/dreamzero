@@ -372,13 +372,14 @@ transform_pusht:
   _target_: groot.vla.data.transform.ComposedModalityTransform
   transforms:
     # Video transforms
+    # NOTE: PushT is a deterministic synthetic renderer with no appearance
+    # variation at eval time, and uses ABSOLUTE pixel-coordinate actions. The
+    # random crop (decorrelates image position from absolute action coords) and
+    # color jitter (color = object identity: green=T, gray=goal, blue=pusher)
+    # are harmful here, so they are intentionally omitted vs the DROID pipeline.
     - <<: *totensor_cfg
       apply_to: ${modality_config_pusht.video.modality_keys}
-    - <<: *crop_cfg
-      apply_to: ${modality_config_pusht.video.modality_keys}
     - <<: *resize_cfg
-      apply_to: ${modality_config_pusht.video.modality_keys}
-    - <<: *color_jitter_cfg
       apply_to: ${modality_config_pusht.video.modality_keys}
     - <<: *to_numpy_cfg
       apply_to: ${modality_config_pusht.video.modality_keys}

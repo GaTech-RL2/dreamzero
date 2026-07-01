@@ -6,19 +6,37 @@ defaults:
 
 max_state_dim: 64
 use_global_metadata: false
+# PushT renders a SQUARE 96x96 frame. The base config defaults to the DROID
+# wide-camera size (image_resolution_width: 480), which would both stretch and
+# upsample PushT. We keep PushT at its NATIVE 96x96 (no fake upsampling): the
+# Wan2.2 VAE reconstructs 96 essentially as well as 256 vs the native frame, and
+# it cuts tokens ~7x (96 -> 3x3=9 tokens/frame vs 256 -> 8x8=64). Must stay in
+# sync with action_head target_video_* and frame_seqlen (=9). H,W divisible by 32.
+image_resolution_width: 96
+image_resolution_height: 96
+image_resolution_width_single_frame: 96
+image_resolution_height_single_frame: 96
 # PushT actions are ABSOLUTE 2D target positions (pixel coords in [0, 512]), not deltas.
 relative_action: false
 relative_action_per_horizon: false
 relative_action_keys: []
 max_chunk_size: 4
 # Use 10% of data in shards before moving to next shard
-dataset_shard_sampling_rate: 0.1
+dataset_shard_sampling_rate: 1.0
 mixture_dataset_cls: groot.vla.data.dataset.lerobot_sharded.ShardedLeRobotMixtureDataset.from_mixture_spec
 single_dataset_cls: groot.vla.data.dataset.lerobot_sharded.ShardedLeRobotSubLangSingleActionChunkDatasetDROID
 
 # Set your PushT (LeRobot-format) dataset path here or override via CLI:
 #   pusht_data_root=/path/to/pusht_lerobot
 pusht_data_root: ???
+
+# Held-out validation split. PushT has 206 episodes; we train on
+# [0, val_episode_start) and validate on [val_episode_start, num_episodes).
+# These feed the dataset's episode_start/episode_end filter so the val episodes
+# are genuinely excluded from training. Eval is only run when eval_strategy is set
+# to "steps" (see train script) -- otherwise only the train-range restriction applies.
+num_episodes: 206
+val_episode_start: 185   # ~10% held out (21 episodes: 185..205)
 
 train_dataset:
   _target_: ${mixture_dataset_cls}
@@ -44,8 +62,51 @@ train_dataset:
     relative_action: ${relative_action}
     relative_action_keys: ${relative_action_keys}
     relative_action_per_horizon: ${relative_action_per_horizon}
+    # Train only on the non-held-out episodes.
+    episode_start: 0
+    episode_end: ${val_episode_start}
   mixture_kwargs:
     training: true
     balance_dataset_weights: false
     seed: 42
     shard_sampling_rate: ${dataset_shard_sampling_rate}
+
+# Held-out validation dataset (episodes [val_episode_start, num_episodes)).
+# Instantiated by VLAExperiment.create_val_dataset when present; the trainer runs
+# eval-loss on it every eval_steps if eval_strategy="steps".
+#
+# MAP-STYLE (non-sharded) on purpose: base LeRobotMixtureDataset + LeRobotSingleDataset
+# are map-style (__len__/__getitem__). With training=false, sample_step is deterministic
+# and covers all held-out steps exactly once, and HF Trainer wraps it in a
+# DistributedSampler that auto-pads ranks to equal length -> NO multi-GPU deadlock
+# (unlike the iterable, file-sharded train dataset). Pair with per_device_eval_batch_size=1
+# so the np.stack collate never needs uniform chunk counts (fixed_num_chunks is train-only).
+val_dataset:
+  _target_: groot.vla.data.dataset.lerobot.LeRobotMixtureDataset.from_mixture_spec
+  _convert_: object
+  mixture_spec:
+    - dataset_path:
+        pusht:
+          - ${pusht_data_root}
+      dataset_weight: 1.0
+      distribute_weights: true
+
+  dataset_class: groot.vla.data.dataset.lerobot.LeRobotSingleDataset
+  all_modality_configs: ${modality_configs}
+  all_transforms: ${transforms}
+  metadata_versions: ${metadata_versions}
+  fps: ${fps}
+  dataset_kwargs:
+    video_backend: opencv
+    use_global_metadata: ${use_global_metadata}
+    max_chunk_size: ${max_chunk_size}
+    relative_action: ${relative_action}
+    relative_action_keys: ${relative_action_keys}
+    relative_action_per_horizon: ${relative_action_per_horizon}
+    # Validate only on the held-out episodes.
+    episode_start: ${val_episode_start}
+    episode_end: ${num_episodes}
+  mixture_kwargs:
+    training: false           # deterministic full-coverage eval; transforms.eval()
+    balance_dataset_weights: false
+    seed: 42

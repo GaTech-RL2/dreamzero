@@ -24,12 +24,35 @@ class ShardedLeRobotSingleDataset(LeRobotSingleDataset):
         self,
         *args,
         num_steps_per_shard: int = int(1e4),
+        episode_start: int | None = None,
+        episode_end: int | None = None,
         **kwargs,
     ):
         self.args = args
         self.kwargs = kwargs
         super().__init__(*args, **kwargs)
         self.num_steps_per_shard = num_steps_per_shard
+        # Optional held-out split: restrict this dataset to episodes in the
+        # half-open range [episode_start, episode_end). Implemented by emptying the
+        # step_filter of out-of-range episodes rather than dropping trajectory ids,
+        # which preserves the (episode_id == array_position) invariant the rest of
+        # this class relies on. Excluded episodes then contribute zero steps to
+        # shard generation and sampling.
+        self.episode_start = episode_start
+        self.episode_end = episode_end
+        if episode_start is not None or episode_end is not None:
+            lo = 0 if episode_start is None else int(episode_start)
+            hi = (int(max(self.trajectory_ids)) + 1) if episode_end is None else int(episode_end)
+            kept = 0
+            for tid in self.trajectory_ids:
+                if lo <= int(tid) < hi:
+                    kept += 1
+                else:
+                    self._step_filter[tid] = np.array([], dtype=np.int64)
+            print(
+                f"[episode split] {self.dataset_path}: keeping episodes [{lo}, {hi}) "
+                f"-> {kept}/{len(self.trajectory_ids)} episodes"
+            )
         self.all_video_paths = self.get_all_video_paths()
         self.all_parquet_paths = self.get_all_parquet_paths()
         self.sharded_trajectories, self.shard_lengths = self.generate_shards()
@@ -327,12 +350,35 @@ class ShardedLeRobotSubLangSingleActionChunkDatasetDROID(LeRobotSingleDataset):
         self,
         *args,
         num_steps_per_shard: int = int(1e4),
+        episode_start: int | None = None,
+        episode_end: int | None = None,
         **kwargs,
     ):
         self.args = args
         self.kwargs = kwargs
         super().__init__(*args, **kwargs)
         self.num_steps_per_shard = num_steps_per_shard
+        # Optional held-out split: restrict this dataset to episodes in the
+        # half-open range [episode_start, episode_end). Implemented by emptying the
+        # step_filter of out-of-range episodes rather than dropping trajectory ids,
+        # which preserves the (episode_id == array_position) invariant the rest of
+        # this class relies on. Excluded episodes then contribute zero steps to
+        # shard generation and sampling.
+        self.episode_start = episode_start
+        self.episode_end = episode_end
+        if episode_start is not None or episode_end is not None:
+            lo = 0 if episode_start is None else int(episode_start)
+            hi = (int(max(self.trajectory_ids)) + 1) if episode_end is None else int(episode_end)
+            kept = 0
+            for tid in self.trajectory_ids:
+                if lo <= int(tid) < hi:
+                    kept += 1
+                else:
+                    self._step_filter[tid] = np.array([], dtype=np.int64)
+            print(
+                f"[episode split] {self.dataset_path}: keeping episodes [{lo}, {hi}) "
+                f"-> {kept}/{len(self.trajectory_ids)} episodes"
+            )
         self.all_video_paths = self.get_all_video_paths()
         self.all_parquet_paths = self.get_all_parquet_paths()
         self.sharded_trajectories, self.shard_lengths = self.generate_shards()
@@ -415,6 +461,18 @@ class ShardedLeRobotSubLangSingleActionChunkDatasetDROID(LeRobotSingleDataset):
                 for trajectory_id in trajectory_ids
                 if trajectory_id not in discarded_episode_indices
             ]
+
+        # Held-out split: exclude out-of-range episodes from sharding entirely
+        # (mirrors the discard filter above). self.trajectory_ids stays full so the
+        # episode_id == array_position invariant is preserved; only the shards are
+        # restricted, which keeps the shard-count math well-formed (no zero-step
+        # trajectories padding the schedule).
+        episode_start = getattr(self, "episode_start", None)
+        episode_end = getattr(self, "episode_end", None)
+        if episode_start is not None or episode_end is not None:
+            lo = 0 if episode_start is None else int(episode_start)
+            hi = (int(max(self.trajectory_ids)) + 1) if episode_end is None else int(episode_end)
+            trajectory_ids = [t for t in trajectory_ids if lo <= int(t) < hi]
 
         assert len(trajectory_ids) > 0, "No valid trajectories found for dataset"
         total_steps = np.sum(

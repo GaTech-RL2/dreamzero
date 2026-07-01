@@ -464,6 +464,11 @@ class DreamTransform(InvertibleModalityTransform):
             return state, state_mask, n_state_tokens
 
         state = data["state"]
+        # The map-style eval dataset (LeRobotSingleDataset) can deliver a single-timestep
+        # state as 1-D (dims,) whereas the sharded train dataset keeps the singleton time
+        # axis (1, dims). Restore the (T, dims) form so the 2-D pad below works; no-op for
+        # already-2-D train samples.
+        state = np.atleast_2d(state)
         assert state.shape[0] % self.state_horizon == 0, f"{state.shape=}, {self.state_horizon=}"
 
         n_state_dims = state.shape[-1]
@@ -495,6 +500,7 @@ class DreamTransform(InvertibleModalityTransform):
             return actions, actions_mask, n_action_tokens
 
         actions = data["action"]
+        actions = np.atleast_2d(actions)  # tolerate 1-D single-step actions from the map-style eval dataset
         assert actions.shape[0] % self.action_horizon == 0, f"{actions.shape=}, {self.action_horizon=}"
 
         n_action_tokens = actions.shape[0]  # T

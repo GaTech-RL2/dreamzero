@@ -135,6 +135,8 @@ class LeRobotSingleDataset(Dataset):
         relative_action: bool = False,
         relative_action_keys: list[str] | None = None,
         relative_action_per_horizon: bool = False,
+        episode_start: int | None = None,
+        episode_end: int | None = None,
     ):
         """
         Initialize the dataset.
@@ -213,6 +215,19 @@ class LeRobotSingleDataset(Dataset):
         self._lerobot_relative_horizon_stats_meta = self._get_lerobot_relative_horizon_stats_meta() if self.relative_action_per_horizon else {}
         self._metadata = self._get_metadata()
         self._step_filter = self._get_step_filter()
+        # Optional held-out split (used for the map-style validation dataset):
+        # restrict to episodes [episode_start, episode_end) by emptying the
+        # step_filter of out-of-range episodes. trajectory_ids/lengths stay full
+        # (preserving the episode_id==array_position invariant); all_steps below is
+        # built from step_filter, so __len__/__getitem__ only see the kept episodes.
+        self.episode_start = episode_start
+        self.episode_end = episode_end
+        if episode_start is not None or episode_end is not None:
+            lo = 0 if episode_start is None else int(episode_start)
+            hi = (int(max(self.trajectory_ids)) + 1) if episode_end is None else int(episode_end)
+            for tid in self.trajectory_ids:
+                if not (lo <= int(tid) < hi):
+                    self._step_filter[tid] = np.array([], dtype=np.int64)
         self._all_steps = self._get_all_steps()
         self._modality_keys = self._get_modality_keys()
         self._delta_indices = self._get_delta_indices()

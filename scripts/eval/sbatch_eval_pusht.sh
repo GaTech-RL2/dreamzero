@@ -30,6 +30,12 @@ export WANDB_ENTITY="${WANDB_ENTITY:-rl2-group}"
 export WANDB_PROJECT="${WANDB_PROJECT:-world-value}"
 WANDB_FLAG=""
 [ "${WANDB_EVAL:-1}" = "1" ] && WANDB_FLAG="--wandb"
+# Explicit run id overrides derive_wandb_run_id — needed when the training run used a wandb
+# auto-id instead of the dzpusht_<size> scheme (e.g. the *_96 runs -> v49jbytw / 818ysd8k).
+[ -n "${WANDB_RUN_ID:-}" ] && WANDB_FLAG="$WANDB_FLAG --wandb_run_id ${WANDB_RUN_ID}"
+# Unique distributed port per job so two evals co-located on one node don't collide on the
+# hardcoded 29577 (init_distributed uses os.environ.setdefault, so this env wins).
+export MASTER_PORT="${MASTER_PORT:-$((20000 + ${SLURM_JOB_ID:-$$} % 40000))}"
 
 .venv/bin/python scripts/eval/run_pusht_eval.py \
   --model_path "$CKPT" --num_episodes "$N" \

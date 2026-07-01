@@ -432,6 +432,20 @@ class BaseTrainer(transformers.Trainer):
 
         return (loss, outputs) if return_outputs else loss
 
+    def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
+        """Eval-loss step for the held-out validation set.
+
+        HF's default prediction_step splats the batch as model(**inputs), but this model's
+        forward takes the batch as a single dict arg (see compute_loss -> model(inputs)) and
+        does not accept keys like `state` as kwargs. Route eval through the same call so the
+        held-out val loss is computed exactly like the training loss (loss-only; no logits/labels).
+        """
+        inputs = self._prepare_inputs(inputs)
+        with torch.no_grad():
+            outputs = model(inputs)
+            loss = outputs["loss"].detach()
+        return (loss, None, None)
+
     def create_optimizer(self):
         """
         Setup the optimizer.
@@ -745,7 +759,27 @@ class BaseExperiment(ABC):
         return train_dataset
 
     def create_val_dataset(self, cfg, model):
-        return None
+        # Optional held-out validation set: if the data config defines `val_dataset`
+        # (e.g. PushT held-out episodes), instantiate it so the trainer can run
+        # periodic eval-loss. Returns None (no eval) when the key is absent.
+        val_cfg = cfg.get("val_dataset", None)
+        if val_cfg is None:
+            return None
+        assert torch.distributed.is_initialized()
+        print("Creating validation dataset")
+        val_dataset = instantiate(val_cfg)
+        # The val mixture is built with training=False so sample_step is DETERMINISTIC
+        # (full single-pass coverage of the held-out steps) and HF wraps it in a
+        # DistributedSampler (no multi-GPU deadlock). But the model-specific transform's
+        # eval/inference mode DROPS the action labels (it only emits action/action_mask/
+        # has_real_action under `if self.training`), so an eval-mode val set cannot produce
+        # a training-comparable LOSS. Flip the per-dataset transforms back to TRAIN mode so
+        # the same loss-bearing fields are produced, while keeping the deterministic sampler.
+        for d in getattr(val_dataset, "datasets", []):
+            t = getattr(d, "transforms", None)
+            if t is not None and hasattr(t, "train"):
+                t.train()
+        return val_dataset
 
     def create_data_collator(self, cfg, model):
         return instantiate(cfg.data_collator)

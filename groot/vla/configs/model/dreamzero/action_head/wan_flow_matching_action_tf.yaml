@@ -106,3 +106,6 @@ action_head_cfg:
 
     tune_projector: true
     tune_diffusion_model: true
+
+    # Set to false for video-only training: skips all action computation and loss.
+    train_action: true

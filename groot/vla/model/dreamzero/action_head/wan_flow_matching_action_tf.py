@@ -138,6 +138,7 @@ class WANPolicyHeadConfig(PretrainedConfig):
         default=None, metadata={"help": "Path to pretrained detection model."}
     )
     detection_coeff: float = field(default=1.0, metadata={"help": "Detection coefficient."})
+    train_action: bool = field(default=True, metadata={"help": "If False, skip all action computation and loss (video-only training)."})
 
     freeze_decode_layer: bool = field(default=False)
     expand_batch: int = field(default=None)
@@ -173,11 +174,6 @@ class WANPolicyHead(ActionHead):
         self.hidden_size = config.hidden_size
         self.num_frames = config.num_frames
         self.text_encoder = instantiate(config.text_encoder_cfg)
-        # CLIP image encoder is optional: pure text-to-video backbones (e.g. Wan2.1-T2V-1.3B) have no
-        # image conditioning and their DiT builds no img_emb (model_type='t2v'). When absent,
-        # first-frame/observation conditioning rides DreamZero's intrinsic clean_x causal path + text.
-        # Key the decision on BOTH the (nulled) image_encoder_cfg and the DiT model_type so a t2v
-        # backbone never instantiates/uses CLIP even if image_encoder_cfg was left set.
         _dm_cfg = config.diffusion_model_cfg or {}
         _model_type = _dm_cfg.get("model_type", None) if hasattr(_dm_cfg, "get") else getattr(_dm_cfg, "model_type", None)
         self.image_encoder = (
@@ -649,6 +645,10 @@ class WANPolicyHead(ActionHead):
         state_features = action_input.state
 
         actions = action_input.action
+        if not getattr(self.config, "train_action", True):
+            # Video-only training: drop actions so all action branches below take their
+            # video-only `else` path (no action tokens, no action loss, no action gradients).
+            actions = actions[:, :0]
         # assert the values of action is in between -1 and 1
         if actions.numel() > 0:
             assert actions.min() >= -1.0 and actions.max() <= 1.0, "actions must be in [-1,1] range"

@@ -1,0 +1,45 @@
+# @package _global_
+# ~300M trainable text+image-to-video (ti2v) DiT on the Wan2.2 VAE, for DreamZero.
+#
+# Sibling of wan_flow_matching_action_tf_300m (Wan2.1 i2v, z=16 VAE), but built on the
+# Wan2.2-TI2V stack instead. Inherits wan_flow_matching_action_tf_wan22, which wires up:
+#   model_type=ti2v, in_dim=48, out_dim=48, concat_first_frame_latent=false,
+#   vae=WanVideoVAE38 (z=48, 16x spatial), and the base CLIP image_encoder_cfg (first-frame
+#   conditioning rides via CLIP in context + the in-context first-frame latent; no [x;y] concat).
+# We override ONLY the DiT size knobs to land at ~300M trainable params, plus the PushT square
+# resolution and from-scratch flags.
+#
+# The DiT trains FROM SCRATCH: at these dims its tensors no longer shape-match any released WAN
+# checkpoint, so skip_component_loading=true bypasses the DiT weight load/download. The frozen
+# T5 text encoder, CLIP image encoder, and Wan2.2 VAE still load (their load happens before the
+# skip gate) -- VAE from checkpoints/Wan2.2-TI2V-5B/Wan2.2_VAE.pth, T5+CLIP+tokenizer from
+# Wan-AI/Wan2.1-I2V-14B-480P (see scripts/train/pusht_training_wan22_ti2v_300m.sh).
+#
+# Sizing: same DiT width/depth as the Wan2.1 300m config (~292.7M at num_layers=19). Switching
+# in_dim 36->48 and out_dim 16->48 only touches patch_embedding + the output head (~+0.16M), so
+# the param count stays ~293M. Re-run scripts/smoke_300m.py if you retune num_layers/ffn_dim.
+#
+# Resolution / frame_seqlen: Wan2.2 VAE38 is 16x spatial; with the DiT's stride-(1,2,2) patch
+# embedding the effective pixel->token stride is 32. PushT runs at its NATIVE 96x96 -> latent 6x6
+# (even, no dynamics-loss crop) -> 3x3 = 9 tokens/frame. The training script sets frame_seqlen=9.
+# (256x256 -> 16x16 latent -> 8x8 = 64 tokens is the alternative; the VAE reconstructs 96 about as
+# well as 256 vs the native frame, so 96 keeps the info at ~7x fewer tokens.) Keep H,W divisible by 32.
+
+defaults:
+  - wan_flow_matching_action_tf_wan22  # Wan2.2-TI2V base: ti2v, in_dim=48, VAE38 z=48, CLIP
+
+train_architecture: full               # from-scratch DiT => full training (never LoRA on random init)
+
+action_head_cfg:
+  config:
+    skip_component_loading: true       # skip DiT load/download; T5 + CLIP + VAE still load (frozen)
+    # PushT is a single square top-down view; override the wan22 5B default (160x320 / DROID).
+    # Native 96x96 (see resolution/frame_seqlen note above); must match data image_resolution_*
+    # and frame_seqlen=9 in the train script.
+    target_video_height: 96
+    target_video_width: 96
+    diffusion_model_cfg:
+      dim: 896
+      ffn_dim: 3584                    # 4x dim
+      num_heads: 7                     # head_dim = 896 / 7 = 128
+      num_layers: 19                   # -> ~292.7M trainable (measured)
